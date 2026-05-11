@@ -50,7 +50,7 @@ public class ChunkStepMixin {
             }
         }
 
-        if (this.targetStatus == ChunkStatus.SURFACE) {
+        if (this.targetStatus == ChunkStatus.CARVERS) {
             ChunkStageHashStorage.INSTANCE.markReady(chunk.getPos(), dimension);
         }
     }
