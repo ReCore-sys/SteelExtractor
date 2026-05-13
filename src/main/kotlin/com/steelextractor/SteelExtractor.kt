@@ -215,7 +215,7 @@ object SteelExtractor : ModInitializer {
                 var generated = 0
                 while (dim.chunkQueue.isNotEmpty() && generated < chunksPerTick) {
                     val pos = dim.chunkQueue.removeFirst()
-                    level.getChunk(pos.x, pos.z, ChunkStatus.CARVERS, true)
+                    level.getChunk(pos.x, pos.z, ChunkStatus.FEATURES, true)
                     generated++
                 }
 
