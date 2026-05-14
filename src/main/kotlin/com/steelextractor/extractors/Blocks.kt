@@ -21,6 +21,7 @@ import net.minecraft.world.level.block.SoundType
 import net.minecraft.world.level.material.PushReaction
 import net.minecraft.world.level.storage.loot.LootTable
 import net.minecraft.world.phys.AABB
+import net.minecraft.world.phys.shapes.CollisionContext
 import org.slf4j.LoggerFactory
 import java.lang.reflect.Field
 import java.util.*
@@ -169,6 +170,9 @@ class Blocks : SteelExtractor.Extractor {
             resultJson.add("collision_shapes", emptyShapeDataJson())
             resultJson.add("support_shapes", emptyShapeDataJson())
             resultJson.add("outline_shapes", emptyShapeDataJson())
+            resultJson.add("occlusion_shapes", emptyShapeDataJson())
+            resultJson.add("interaction_shapes", emptyShapeDataJson())
+            resultJson.add("visual_shapes", emptyShapeDataJson())
             return resultJson
         }
 
@@ -187,6 +191,21 @@ class Blocks : SteelExtractor.Extractor {
             state.getBlockSupportShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO).toAabbs()
         }
 
+        // Compute occlusion shapes
+        val (defaultOcclusionAabbs, defaultOcclusionIdxs, occlusionMap) = computeShapeData(possibleStates) { state ->
+            state.getOcclusionShape().toAabbs()
+        }
+
+        // Compute interaction shapes
+        val (defaultInteractionAabbs, defaultInteractionIdxs, interactionMap) = computeShapeData(possibleStates) { state ->
+            state.getInteractionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO).toAabbs()
+        }
+
+        // Compute visual shapes
+        val (defaultVisualAabbs, defaultVisualIdxs, visualMap) = computeShapeData(possibleStates) { state ->
+            state.getVisualShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, CollisionContext.empty()).toAabbs()
+        }
+
         resultJson.add(
             "collision_shapes",
             buildShapeDataJson(possibleStates, defaultCollisionAabbs, defaultCollisionIdxs, collisionMap, "Collision") { state ->
@@ -203,6 +222,24 @@ class Blocks : SteelExtractor.Extractor {
             "outline_shapes",
             buildShapeDataJson(possibleStates, defaultOutlineAabbs, defaultOutlineIdxs, outlineMap, "Outline") { state ->
                 state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO).toAabbs()
+            }
+        )
+        resultJson.add(
+            "occlusion_shapes",
+            buildShapeDataJson(possibleStates, defaultOcclusionAabbs, defaultOcclusionIdxs, occlusionMap, "Occlusion") { state ->
+                state.getOcclusionShape().toAabbs()
+            }
+        )
+        resultJson.add(
+            "interaction_shapes",
+            buildShapeDataJson(possibleStates, defaultInteractionAabbs, defaultInteractionIdxs, interactionMap, "Interaction") { state ->
+                state.getInteractionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO).toAabbs()
+            }
+        )
+        resultJson.add(
+            "visual_shapes",
+            buildShapeDataJson(possibleStates, defaultVisualAabbs, defaultVisualIdxs, visualMap, "Visual") { state ->
+                state.getVisualShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, CollisionContext.empty()).toAabbs()
             }
         )
 
@@ -293,6 +330,9 @@ class Blocks : SteelExtractor.Extractor {
             blockJson.add("collision_shapes", shapesStructureJson.getAsJsonObject("collision_shapes"))
             blockJson.add("support_shapes", shapesStructureJson.getAsJsonObject("support_shapes"))
             blockJson.add("outline_shapes", shapesStructureJson.getAsJsonObject("outline_shapes"))
+            blockJson.add("occlusion_shapes", shapesStructureJson.getAsJsonObject("occlusion_shapes"))
+            blockJson.add("interaction_shapes", shapesStructureJson.getAsJsonObject("interaction_shapes"))
+            blockJson.add("visual_shapes", shapesStructureJson.getAsJsonObject("visual_shapes"))
 
             // Only add if there are actual differences
             if (behaviourJson.size() > 0) {
