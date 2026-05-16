@@ -67,6 +67,9 @@ object SteelExtractor : ModInitializer {
     private const val CARVER_CHUNKS_PER_TICK = CHUNKS_PER_CLUSTER
     private const val FEATURE_CHUNKS_PER_TICK = CHUNKS_PER_CLUSTER
     private val CHUNK_POSITION_ORDER: Comparator<ChunkPos> = compareBy({ it.x }, { it.z })
+    private const val DEBUG_CLUSTER_ENV = "STEEL_EXTRACTOR_DEBUG_CLUSTER"
+    private const val DEBUG_DIMENSION_ENV = "STEEL_EXTRACTOR_DEBUG_DIMENSION"
+    private const val DEBUG_SKIP_IMMEDIATE_ENV = "STEEL_EXTRACTOR_SKIP_IMMEDIATE"
 
     /** Generate the same sampled chunk clusters used by chunk stage hash extraction. */
     fun sampledChunkClusters(): List<List<ChunkPos>> {
@@ -89,6 +92,32 @@ object SteelExtractor : ModInitializer {
     /** Generate the same sampled chunk positions used by chunk stage hash extraction. */
     fun sampledChunkPositions(): List<ChunkPos> {
         return sampledChunkClusters().flatten()
+    }
+
+    private fun focusedChunkCluster(origin: ChunkPos): List<ChunkPos> {
+        val positions = mutableListOf<ChunkPos>()
+        for (dx in 0 until CLUSTER_SIZE) {
+            for (dz in 0 until CLUSTER_SIZE) {
+                positions.add(ChunkPos(origin.x + dx, origin.z + dz))
+            }
+        }
+        return positions
+    }
+
+    private fun debugClusterOrigin(): ChunkPos? {
+        val value = System.getenv(DEBUG_CLUSTER_ENV)?.takeIf { it.isNotBlank() } ?: return null
+        val parts = value.split(",", limit = 2)
+        require(parts.size == 2) { "$DEBUG_CLUSTER_ENV must be formatted as '<chunk_x>,<chunk_z>'" }
+        val x = parts[0].toIntOrNull()
+            ?: error("$DEBUG_CLUSTER_ENV chunk_x is not an integer: ${parts[0]}")
+        val z = parts[1].toIntOrNull()
+            ?: error("$DEBUG_CLUSTER_ENV chunk_z is not an integer: ${parts[1]}")
+        return ChunkPos(x, z)
+    }
+
+    private fun envFlag(name: String): Boolean {
+        val value = System.getenv(name)?.takeIf { it.isNotBlank() } ?: return false
+        return value == "1" || value.equals("true", ignoreCase = true) || value.equals("yes", ignoreCase = true)
     }
 
     override fun onInitialize() {
@@ -130,21 +159,40 @@ object SteelExtractor : ModInitializer {
 
         val chunkStageExtractor = ChunkStageHashes()
 
-        val dimensions = listOf(
+        val allDimensions = listOf(
             "minecraft:overworld" to Level.OVERWORLD,
             "minecraft:the_nether" to Level.NETHER,
             "minecraft:the_end" to Level.END
         )
 
-        val sampledClusters = sampledChunkClusters()
+        val debugDimension = System.getenv(DEBUG_DIMENSION_ENV)?.takeIf { it.isNotBlank() }
+        val dimensions = if (debugDimension == null) {
+            allDimensions
+        } else {
+            val selected = allDimensions.filter { (dimId, _) -> dimId == debugDimension }
+            require(selected.isNotEmpty()) {
+                "$DEBUG_DIMENSION_ENV must be one of ${allDimensions.joinToString { it.first }}"
+            }
+            logger.warn("Focused chunk extraction enabled for dimension $debugDimension")
+            selected
+        }
+
+        val debugClusterOrigin = debugClusterOrigin()
+        val sampledClusters = if (debugClusterOrigin == null) {
+            sampledChunkClusters()
+        } else {
+            logger.warn("Focused chunk extraction enabled for cluster origin (${debugClusterOrigin.x}, ${debugClusterOrigin.z})")
+            listOf(focusedChunkCluster(debugClusterOrigin))
+        }
         val sampledPositions = sampledClusters.flatten()
         val generationClusters = sampledClusters
             .map { cluster -> cluster.sortedWith(CHUNK_POSITION_ORDER) }
             .sortedWith(compareBy({ it.first().x }, { it.first().z }))
+        val clusterCount = generationClusters.size
 
         if (ENABLE_CHUNK_EXTRACTION) {
             ServerLifecycleEvents.SERVER_STARTING.register { _ ->
-                logger.info("Setting up chunk stage hash tracking ($NUM_SAMPLE_CHUNKS sampled chunks from ${SAMPLE_HALF_RANGE * 2}x${SAMPLE_HALF_RANGE * 2} area, ${dimensions.size} dimensions)")
+                logger.info("Setting up chunk stage hash tracking (${sampledPositions.size} sampled chunks from ${SAMPLE_HALF_RANGE * 2}x${SAMPLE_HALF_RANGE * 2} area, ${dimensions.size} dimensions)")
                 val chunksToTrack = mutableSetOf<DimChunkPos>()
                 for ((dimId, _) in dimensions) {
                     for (pos in sampledPositions) {
@@ -169,12 +217,16 @@ object SteelExtractor : ModInitializer {
         val gson = GsonBuilder().disableHtmlEscaping().setPrettyPrinting().create()
 
         ServerLifecycleEvents.SERVER_STARTED.register(ServerLifecycleEvents.ServerStarted { server: MinecraftServer ->
-            val timeInMillis = measureTimeMillis {
-                for (ext in immediateExtractors) {
-                    runExtractor(ext, outputDirectory, gson, server)
+            if (envFlag(DEBUG_SKIP_IMMEDIATE_ENV)) {
+                logger.warn("Skipping immediate extractors because $DEBUG_SKIP_IMMEDIATE_ENV is enabled")
+            } else {
+                val timeInMillis = measureTimeMillis {
+                    for (ext in immediateExtractors) {
+                        runExtractor(ext, outputDirectory, gson, server)
+                    }
                 }
+                logger.info("Immediate extractors done, took ${timeInMillis}ms")
             }
-            logger.info("Immediate extractors done, took ${timeInMillis}ms")
 
 
             if (!ENABLE_CHUNK_EXTRACTION) {
@@ -279,8 +331,8 @@ object SteelExtractor : ModInitializer {
 
                 val dimProgress = dim.carverProgress + dim.featureProgress
                 val overallProgress = currentDimIdx * chunksPerDim * 2 + dimProgress
-                val clusterNumber = NUM_CLUSTERS - dim.clusters.size + 1
-                logger.info("Chunk generation progress: $overallProgress/$totalChunkSteps (${dim.dimId}: cluster $clusterNumber/$NUM_CLUSTERS, carvers ${dim.carverProgress}/$chunksPerDim, features ${dim.featureProgress}/$chunksPerDim)")
+                val clusterNumber = clusterCount - dim.clusters.size + 1
+                logger.info("Chunk generation progress: $overallProgress/$totalChunkSteps (${dim.dimId}: cluster $clusterNumber/$clusterCount, carvers ${dim.carverProgress}/$chunksPerDim, features ${dim.featureProgress}/$chunksPerDim)")
 
                 if (cluster.carverQueue.isEmpty() && cluster.featureQueue.isEmpty()) {
                     // Mark any chunks loaded from disk as ready.

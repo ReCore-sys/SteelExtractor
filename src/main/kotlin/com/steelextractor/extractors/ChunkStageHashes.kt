@@ -33,6 +33,7 @@ class ChunkStageHashes : SteelExtractor.Extractor {
         json.addProperty("chunk_generation_order", "x_z_ascending")
         json.addProperty("feature_hash_capture", "after_all_tracked_features_ready")
         json.addProperty("biome_tie_breaker", "vanilla_rtree_chunk_local_cache")
+        json.addProperty("hashset_iteration_order", "insertion_order")
 
         if (worldSeed != 13579L) {
             logger.warn("World seed is $worldSeed, not 13579! Set level-seed=13579 in server.properties and delete the world folder.")
