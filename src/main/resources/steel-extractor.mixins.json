@@ -1,10 +1,18 @@
 {
 	"required": true,
 	"package": "com.steelextractor.mixin",
-	"compatibilityLevel": "JAVA_21",
+	"compatibilityLevel": "JAVA_25",
 	"mixins": [
 		"ExampleMixin",
-		"ChunkStepMixin"
+		"ChunkStepMixin",
+		"ChunkAccessBiomeCacheMixin",
+		"ClimateRTreeMixin",
+		"BiomeSourcePossibleBiomesMixin",
+		"AxeItemAccessor",
+		"VegetationPatchFeatureMixin",
+		"WaterloggedVegetationPatchFeatureMixin",
+		"TreeFeatureMixin",
+		"FallenTreeFeatureMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1
