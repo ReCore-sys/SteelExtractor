@@ -20,6 +20,7 @@ import com.steelextractor.extractors.SoundTypes
 import com.steelextractor.extractors.MultiNoiseBiomeParameters
 import com.steelextractor.extractors.BiomeHashes
 import com.steelextractor.extractors.ChunkStageHashes
+import com.steelextractor.extractors.GameEvents
 import com.steelextractor.extractors.Weathering
 import com.steelextractor.extractors.Strippables
 import net.minecraft.resources.ResourceKey
@@ -112,7 +113,8 @@ object SteelExtractor : ModInitializer {
             Strippables(),
             Weathering(),
             Waxables(),
-            PoiTypesExtractor()
+            PoiTypesExtractor(),
+            GameEvents(),
         )
 
 
