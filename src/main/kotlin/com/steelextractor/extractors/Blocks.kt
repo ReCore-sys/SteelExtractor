@@ -30,6 +30,12 @@ class Blocks : SteelExtractor.Extractor {
     private val logger = LoggerFactory.getLogger("steel-extractor-blocks")
     private val shapes: LinkedHashMap<AABB, Int> = LinkedHashMap()
 
+    private data class StateLightProperties(
+        val lightEmission: Int,
+        val lightDampening: Int,
+        val useShapeForLightOcclusion: Boolean,
+    )
+
 
     override fun fileName(): String {
         return "steel-registry/build_assets/blocks.json"
@@ -246,6 +252,59 @@ class Blocks : SteelExtractor.Extractor {
         return resultJson
     }
 
+    private fun stateLightProperties(state: BlockState): StateLightProperties {
+        return StateLightProperties(
+            state.lightEmission,
+            state.lightDampening,
+            state.useShapeForLightOcclusion()
+        )
+    }
+
+    private fun stateLightPropertiesJson(properties: StateLightProperties): JsonObject {
+        val json = JsonObject()
+        json.addProperty("lightEmission", properties.lightEmission)
+        json.addProperty("lightDampening", properties.lightDampening)
+        json.addProperty("useShapeForLightOcclusion", properties.useShapeForLightOcclusion)
+        return json
+    }
+
+    private fun createLightPropertiesJson(block: Block): JsonObject {
+        val resultJson = JsonObject()
+        val possibleStates = block.stateDefinition.possibleStates
+        if (possibleStates.isEmpty()) {
+            resultJson.add("default", stateLightPropertiesJson(StateLightProperties(0, 0, false)))
+            resultJson.add("overwrites", JsonArray())
+            return resultJson
+        }
+
+        val propertyCounts = LinkedHashMap<StateLightProperties, Int>()
+        for (state in possibleStates) {
+            propertyCounts.merge(stateLightProperties(state), 1, Int::plus)
+        }
+
+        var defaultProperties = stateLightProperties(possibleStates[0])
+        var defaultCount = 0
+        for ((properties, count) in propertyCounts) {
+            if (count > defaultCount) {
+                defaultProperties = properties
+                defaultCount = count
+            }
+        }
+        resultJson.add("default", stateLightPropertiesJson(defaultProperties))
+
+        val overwrites = JsonArray()
+        for (i in possibleStates.indices) {
+            val currentProperties = stateLightProperties(possibleStates[i])
+            if (currentProperties != defaultProperties) {
+                val overwrite = stateLightPropertiesJson(currentProperties)
+                overwrite.addProperty("offset", i)
+                overwrites.add(overwrite)
+            }
+        }
+        resultJson.add("overwrites", overwrites)
+        return resultJson
+    }
+
     override fun extract(server: MinecraftServer): JsonElement {
         val topLevelJson = JsonObject()
 
@@ -333,6 +392,7 @@ class Blocks : SteelExtractor.Extractor {
             blockJson.add("occlusion_shapes", shapesStructureJson.getAsJsonObject("occlusion_shapes"))
             blockJson.add("interaction_shapes", shapesStructureJson.getAsJsonObject("interaction_shapes"))
             blockJson.add("visual_shapes", shapesStructureJson.getAsJsonObject("visual_shapes"))
+            blockJson.add("light_properties", createLightPropertiesJson(block))
 
             // Only add if there are actual differences
             if (behaviourJson.size() > 0) {
