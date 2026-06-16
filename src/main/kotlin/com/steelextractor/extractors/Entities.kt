@@ -137,6 +137,7 @@ class Entities : SteelExtractor.Extractor {
                 // Flags
                 entityTypeJson.addProperty("fire_immune", entityType.fireImmune())
                 entityTypeJson.addProperty("summonable", entityType.canSummon())
+                entityTypeJson.addProperty("allowed_in_peaceful", entityType.isAllowedInPeaceful())
                 entityTypeJson.addProperty("can_serialize", entityType.canSerialize())
                 entityTypeJson.addProperty("can_spawn_far_from_player", entityType.canSpawnFarFromPlayer())
 
