@@ -407,6 +407,48 @@ class Blocks : SteelExtractor.Extractor {
         return resultJson
     }
 
+    private fun createSuffocatingPropertiesJson(block: Block): JsonObject {
+        val resultJson = JsonObject()
+        val possibleStates = block.stateDefinition.possibleStates
+        if (possibleStates.isEmpty()) {
+            resultJson.addProperty("default", false)
+            resultJson.add("overwrites", JsonArray())
+            return resultJson
+        }
+
+        val propertyCounts = LinkedHashMap<Boolean, Int>()
+        for (state in possibleStates) {
+            propertyCounts.merge(
+                state.isSuffocating(EmptyBlockGetter.INSTANCE, BlockPos.ZERO),
+                1,
+                Int::plus
+            )
+        }
+
+        var defaultValue = possibleStates[0].isSuffocating(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)
+        var defaultCount = 0
+        for ((value, count) in propertyCounts) {
+            if (count > defaultCount) {
+                defaultValue = value
+                defaultCount = count
+            }
+        }
+        resultJson.addProperty("default", defaultValue)
+
+        val overwrites = JsonArray()
+        for (i in possibleStates.indices) {
+            val currentValue = possibleStates[i].isSuffocating(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)
+            if (currentValue != defaultValue) {
+                val overwrite = JsonObject()
+                overwrite.addProperty("offset", i)
+                overwrite.addProperty("value", currentValue)
+                overwrites.add(overwrite)
+            }
+        }
+        resultJson.add("overwrites", overwrites)
+        return resultJson
+    }
+
     override fun extract(server: MinecraftServer): JsonElement {
         val topLevelJson = JsonObject()
 
@@ -498,6 +540,7 @@ class Blocks : SteelExtractor.Extractor {
             blockJson.add("interaction_shapes", shapesStructureJson.getAsJsonObject("interaction_shapes"))
             blockJson.add("visual_shapes", shapesStructureJson.getAsJsonObject("visual_shapes"))
             blockJson.add("light_properties", createLightPropertiesJson(block))
+            blockJson.add("suffocating", createSuffocatingPropertiesJson(block))
 
             // Only add if there are actual differences
             if (behaviourJson.size() > 0) {
