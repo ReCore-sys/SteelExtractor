@@ -45,6 +45,7 @@ class Classes : SteelExtractor.Extractor {
             is SoundEvent -> BuiltInRegistries.SOUND_EVENT.getKey(value)?.path?.let { json.addProperty(key, it) }
             is Block -> BuiltInRegistries.BLOCK.getKey(value)?.path?.let { json.addProperty(key, it) }
             is Item -> BuiltInRegistries.ITEM.getKey(value)?.path?.let { json.addProperty(key, it) }
+            is EntityType<*> -> BuiltInRegistries.ENTITY_TYPE.getKey(value)?.path?.let { json.addProperty(key, it) }
             else -> {
                 if (depth < 1) {
                     extractDeclaredFields(value, value.javaClass, json, key, depth + 1)
