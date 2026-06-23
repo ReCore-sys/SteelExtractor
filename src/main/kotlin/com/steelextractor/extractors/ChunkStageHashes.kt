@@ -37,8 +37,9 @@ class ChunkStageHashes : SteelExtractor.Extractor {
         json.addProperty("hashset_iteration_order", "insertion_order")
         json.addProperty("light_hash_capture", "after_all_tracked_light_ready_pending_tasks_drained_and_light_engine_idle")
         json.addProperty("light_dependency_radius", SteelExtractor.LIGHT_DEPENDENCY_RADIUS)
-        json.addProperty("light_hash_format", "packet_data_layers_v1")
+        json.addProperty("light_feature_dependency_capture", "after_tracked_features_before_light_x_z_ascending")
         json.addProperty("light_binary_format", "packet_data_layers_and_sky_sources_binary_v1")
+        json.addProperty("light_hash_format", "packet_data_layers_v1")
 
         if (worldSeed != 13579L) {
             logger.warn("World seed is $worldSeed, not 13579! Set level-seed=13579 in server.properties and delete the world folder.")

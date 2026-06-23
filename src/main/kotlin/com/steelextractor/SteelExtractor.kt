@@ -73,6 +73,7 @@ object SteelExtractor : ModInitializer {
     private const val CARVER_CHUNKS_PER_TICK = CHUNKS_PER_CLUSTER
     private const val FEATURE_CHUNKS_PER_TICK = CHUNKS_PER_CLUSTER
     private const val LIGHT_CHUNKS_PER_TICK = CHUNKS_PER_CLUSTER
+    private const val LIGHT_FEATURE_CHUNKS_PER_TICK = CHUNKS_PER_CLUSTER
     private const val LIGHT_CAPTURE_READY_PASSES = 2
     private const val MAX_LIGHT_CAPTURE_WAIT_PASSES = 200
     private const val MAX_LIGHT_CAPTURE_PROBE_SAMPLES = 8
@@ -115,16 +116,29 @@ object SteelExtractor : ModInitializer {
         return positions
     }
 
-    private fun lightDependencyPositions(positions: List<ChunkPos>): List<ChunkPos> {
-        val lightPositions = mutableSetOf<ChunkPos>()
+    private fun expandPositions(positions: List<ChunkPos>, radius: Int): List<ChunkPos> {
+        val expanded = mutableSetOf<ChunkPos>()
         for (pos in positions) {
-            for (dx in -LIGHT_DEPENDENCY_RADIUS..LIGHT_DEPENDENCY_RADIUS) {
-                for (dz in -LIGHT_DEPENDENCY_RADIUS..LIGHT_DEPENDENCY_RADIUS) {
-                    lightPositions.add(ChunkPos(pos.x + dx, pos.z + dz))
+            for (dx in -radius..radius) {
+                for (dz in -radius..radius) {
+                    expanded.add(ChunkPos(pos.x + dx, pos.z + dz))
                 }
             }
         }
-        return lightPositions.sortedWith(CHUNK_POSITION_ORDER)
+        return expanded.sortedWith(CHUNK_POSITION_ORDER)
+    }
+
+    private fun lightDependencyPositions(positions: List<ChunkPos>): List<ChunkPos> {
+        return expandPositions(positions, LIGHT_DEPENDENCY_RADIUS)
+    }
+
+    private fun lightFeatureDependencyPositions(positions: List<ChunkPos>): List<ChunkPos> {
+        return expandPositions(lightDependencyPositions(positions), 1)
+    }
+
+    private fun exceptPositions(positions: List<ChunkPos>, excluded: List<ChunkPos>): List<ChunkPos> {
+        val excludedSet = excluded.toSet()
+        return positions.filter { !excludedSet.contains(it) }.sortedWith(CHUNK_POSITION_ORDER)
     }
 
     private fun debugClusterOrigin(): ChunkPos? {
@@ -299,12 +313,15 @@ object SteelExtractor : ModInitializer {
         data class ClusterWork(
             val positions: List<ChunkPos>,
             val lightPositions: List<ChunkPos>,
+            val lightFeaturePositions: List<ChunkPos>,
             val carverQueue: ArrayDeque<ChunkPos>,
             val featureQueue: ArrayDeque<ChunkPos>,
+            val lightFeatureQueue: ArrayDeque<ChunkPos>,
             val lightQueue: ArrayDeque<ChunkPos>,
             val featureChunks: MutableMap<ChunkPos, ChunkAccess> = mutableMapOf(),
             val lightChunks: MutableMap<ChunkPos, ChunkAccess> = mutableMapOf(),
             var featureHashesCaptured: Boolean = false,
+            var lightFeaturesGenerated: Boolean = false,
             var lightHashesCaptured: Boolean = false,
             var pendingLightCaptureBarrier: CompletableFuture<Void>? = null,
             var lightCaptureReadyPasses: Int = 0,
@@ -317,6 +334,7 @@ object SteelExtractor : ModInitializer {
             val clusters: ArrayDeque<ClusterWork>,
             var carverProgress: Int = 0,
             var featureProgress: Int = 0,
+            var lightFeatureProgress: Int = 0,
             var lightProgress: Int = 0
         )
 
@@ -330,14 +348,18 @@ object SteelExtractor : ModInitializer {
                 val lightPositions = lightDependencyPositions(positions)
                 val lightQueue = ArrayDeque<ChunkPos>()
                 lightQueue.addAll(lightPositions)
-                clusters.add(ClusterWork(positions, lightPositions, carverQueue, featureQueue, lightQueue))
+                val lightFeaturePositions = lightFeatureDependencyPositions(positions)
+                val lightFeatureQueue = ArrayDeque<ChunkPos>()
+                lightFeatureQueue.addAll(exceptPositions(lightFeaturePositions, positions))
+                clusters.add(ClusterWork(positions, lightPositions, lightFeaturePositions, carverQueue, featureQueue, lightFeatureQueue, lightQueue))
             }
             DimensionWork(key, dimId, clusters)
         }
         val chunksPerDim = sampledPositions.size
+        val lightFeatureChunksPerDim = generationClusters.sumOf { exceptPositions(lightFeatureDependencyPositions(it), it).size }
         val lightChunksPerDim = generationClusters.sumOf { lightDependencyPositions(it).size }
         val totalChunks = chunksPerDim * dimWork.size
-        val totalChunkSteps = (chunksPerDim * 2 + lightChunksPerDim) * dimWork.size
+        val totalChunkSteps = (chunksPerDim * 2 + lightFeatureChunksPerDim + lightChunksPerDim) * dimWork.size
 
         var generationStarted = false
         var currentDimIdx = 0
@@ -351,7 +373,7 @@ object SteelExtractor : ModInitializer {
             // Start generation on first tick after server is ready
             if (!generationStarted) {
                 generationStarted = true
-                logger.info("Forcing deterministic generation of $totalChunks chunks across ${dimWork.size} dimensions (carvers $CARVER_CHUNKS_PER_TICK/tick, features $FEATURE_CHUNKS_PER_TICK/tick, light $LIGHT_CHUNKS_PER_TICK/tick, order x/z ascending)...")
+                logger.info("Forcing deterministic generation of $totalChunks chunks across ${dimWork.size} dimensions (carvers $CARVER_CHUNKS_PER_TICK/tick, features $FEATURE_CHUNKS_PER_TICK/tick, light features $LIGHT_FEATURE_CHUNKS_PER_TICK/tick, light $LIGHT_CHUNKS_PER_TICK/tick, order x/z ascending)...")
             }
 
             // Generate a batch of chunks per tick, one dimension at a time
@@ -378,12 +400,16 @@ object SteelExtractor : ModInitializer {
                     return@register
                 }
 
+                val runningLightFeatureQueue = cluster.featureQueue.isEmpty() && cluster.lightFeatureQueue.isNotEmpty()
                 val (queue, status, batchSize) = when {
                     cluster.carverQueue.isNotEmpty() -> {
                         Triple(cluster.carverQueue, ChunkStatus.CARVERS, CARVER_CHUNKS_PER_TICK)
                     }
                     cluster.featureQueue.isNotEmpty() -> {
                         Triple(cluster.featureQueue, ChunkStatus.FEATURES, FEATURE_CHUNKS_PER_TICK)
+                    }
+                    cluster.lightFeatureQueue.isNotEmpty() -> {
+                        Triple(cluster.lightFeatureQueue, ChunkStatus.FEATURES, LIGHT_FEATURE_CHUNKS_PER_TICK)
                     }
                     else -> {
                         Triple(cluster.lightQueue, ChunkStatus.LIGHT, LIGHT_CHUNKS_PER_TICK)
@@ -398,7 +424,11 @@ object SteelExtractor : ModInitializer {
                         if (chunk != null) {
                             cluster.featureChunks[pos] = chunk
                         }
-                        dim.featureProgress++
+                        if (runningLightFeatureQueue) {
+                            dim.lightFeatureProgress++
+                        } else {
+                            dim.featureProgress++
+                        }
                     } else if (status == ChunkStatus.LIGHT) {
                         if (chunk != null) {
                             cluster.lightChunks[pos] = chunk
@@ -426,14 +456,20 @@ object SteelExtractor : ModInitializer {
                     cluster.featureHashesCaptured = true
                 }
 
-                val dimProgress = dim.carverProgress + dim.featureProgress + dim.lightProgress
-                val overallProgress = currentDimIdx * (chunksPerDim * 2 + lightChunksPerDim) + dimProgress
+                if (cluster.featureHashesCaptured && cluster.lightFeatureQueue.isEmpty() && !cluster.lightFeaturesGenerated) {
+                    cluster.lightFeaturesGenerated = true
+                    logger.info("Generated deterministic light dependency features for ${cluster.lightFeaturePositions.size} chunks in ${dim.dimId}")
+                }
+
+                val dimProgress = dim.carverProgress + dim.featureProgress + dim.lightFeatureProgress + dim.lightProgress
+                val overallProgress = currentDimIdx * (chunksPerDim * 2 + lightFeatureChunksPerDim + lightChunksPerDim) + dimProgress
                 val clusterNumber = clusterCount - dim.clusters.size + 1
-                logger.info("Chunk generation progress: $overallProgress/$totalChunkSteps (${dim.dimId}: cluster $clusterNumber/$clusterCount, carvers ${dim.carverProgress}/$chunksPerDim, features ${dim.featureProgress}/$chunksPerDim, light ${dim.lightProgress}/$lightChunksPerDim)")
+                logger.info("Chunk generation progress: $overallProgress/$totalChunkSteps (${dim.dimId}: cluster $clusterNumber/$clusterCount, carvers ${dim.carverProgress}/$chunksPerDim, features ${dim.featureProgress}/$chunksPerDim, light features ${dim.lightFeatureProgress}/$lightFeatureChunksPerDim, light ${dim.lightProgress}/$lightChunksPerDim)")
 
                 if (
                     cluster.carverQueue.isEmpty() &&
                     cluster.featureQueue.isEmpty() &&
+                    cluster.lightFeatureQueue.isEmpty() &&
                     cluster.lightQueue.isEmpty() &&
                     !cluster.lightHashesCaptured
                 ) {
@@ -497,6 +533,7 @@ object SteelExtractor : ModInitializer {
                 if (
                     cluster.carverQueue.isEmpty() &&
                     cluster.featureQueue.isEmpty() &&
+                    cluster.lightFeatureQueue.isEmpty() &&
                     cluster.lightQueue.isEmpty()
                 ) {
                     dim.clusters.removeFirst()
