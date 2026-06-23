@@ -50,6 +50,7 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.util.concurrent.CompletableFuture
 import kotlin.random.Random
 import kotlin.system.measureTimeMillis
 
@@ -71,10 +72,15 @@ object SteelExtractor : ModInitializer {
     private const val SAMPLE_HALF_RANGE: Int = 500_000 // 1000,000x1000,000 chunk area
     private const val CARVER_CHUNKS_PER_TICK = CHUNKS_PER_CLUSTER
     private const val FEATURE_CHUNKS_PER_TICK = CHUNKS_PER_CLUSTER
+    private const val LIGHT_CHUNKS_PER_TICK = CHUNKS_PER_CLUSTER
+    private const val LIGHT_CAPTURE_READY_PASSES = 2
+    private const val MAX_LIGHT_CAPTURE_WAIT_PASSES = 200
+    private const val MAX_LIGHT_CAPTURE_PROBE_SAMPLES = 8
     private val CHUNK_POSITION_ORDER: Comparator<ChunkPos> = compareBy({ it.x }, { it.z })
     private const val DEBUG_CLUSTER_ENV = "STEEL_EXTRACTOR_DEBUG_CLUSTER"
     private const val DEBUG_DIMENSION_ENV = "STEEL_EXTRACTOR_DEBUG_DIMENSION"
     private const val DEBUG_SKIP_IMMEDIATE_ENV = "STEEL_EXTRACTOR_SKIP_IMMEDIATE"
+    const val LIGHT_DEPENDENCY_RADIUS: Int = 1
 
     /** Generate the same sampled chunk clusters used by chunk stage hash extraction. */
     fun sampledChunkClusters(): List<List<ChunkPos>> {
@@ -109,6 +115,18 @@ object SteelExtractor : ModInitializer {
         return positions
     }
 
+    private fun lightDependencyPositions(positions: List<ChunkPos>): List<ChunkPos> {
+        val lightPositions = mutableSetOf<ChunkPos>()
+        for (pos in positions) {
+            for (dx in -LIGHT_DEPENDENCY_RADIUS..LIGHT_DEPENDENCY_RADIUS) {
+                for (dz in -LIGHT_DEPENDENCY_RADIUS..LIGHT_DEPENDENCY_RADIUS) {
+                    lightPositions.add(ChunkPos(pos.x + dx, pos.z + dz))
+                }
+            }
+        }
+        return lightPositions.sortedWith(CHUNK_POSITION_ORDER)
+    }
+
     private fun debugClusterOrigin(): ChunkPos? {
         val value = System.getenv(DEBUG_CLUSTER_ENV)?.takeIf { it.isNotBlank() } ?: return null
         val parts = value.split(",", limit = 2)
@@ -123,6 +141,35 @@ object SteelExtractor : ModInitializer {
     private fun envFlag(name: String): Boolean {
         val value = System.getenv(name)?.takeIf { it.isNotBlank() } ?: return false
         return value == "1" || value.equals("true", ignoreCase = true) || value.equals("yes", ignoreCase = true)
+    }
+
+    private data class LightCaptureProbe(
+        val missingChunks: Int,
+        val samples: List<String>
+    ) {
+        val isReady: Boolean
+            get() = missingChunks == 0
+    }
+
+    private fun probeLightCaptureReadiness(
+        level: ServerLevel,
+        positions: List<ChunkPos>,
+        lightChunks: Map<ChunkPos, ChunkAccess>
+    ): LightCaptureProbe {
+        var missingChunks = 0
+        val samples = mutableListOf<String>()
+
+        for (pos in positions) {
+            val chunk = lightChunks[pos] ?: level.getChunk(pos.x, pos.z, ChunkStatus.LIGHT, false)
+            if (chunk == null) {
+                missingChunks++
+                if (samples.size < MAX_LIGHT_CAPTURE_PROBE_SAMPLES) {
+                    samples.add("missing LIGHT chunk (${pos.x}, ${pos.z})")
+                }
+            }
+        }
+
+        return LightCaptureProbe(missingChunks, samples)
     }
 
     override fun onInitialize() {
@@ -251,9 +298,17 @@ object SteelExtractor : ModInitializer {
         // aligned with the serialized JSON/test order.
         data class ClusterWork(
             val positions: List<ChunkPos>,
+            val lightPositions: List<ChunkPos>,
             val carverQueue: ArrayDeque<ChunkPos>,
             val featureQueue: ArrayDeque<ChunkPos>,
-            val featureChunks: MutableMap<ChunkPos, ChunkAccess> = mutableMapOf()
+            val lightQueue: ArrayDeque<ChunkPos>,
+            val featureChunks: MutableMap<ChunkPos, ChunkAccess> = mutableMapOf(),
+            val lightChunks: MutableMap<ChunkPos, ChunkAccess> = mutableMapOf(),
+            var featureHashesCaptured: Boolean = false,
+            var lightHashesCaptured: Boolean = false,
+            var pendingLightCaptureBarrier: CompletableFuture<Void>? = null,
+            var lightCaptureReadyPasses: Int = 0,
+            var lightCaptureWaitPasses: Int = 0
         )
 
         data class DimensionWork(
@@ -261,7 +316,8 @@ object SteelExtractor : ModInitializer {
             val dimId: String,
             val clusters: ArrayDeque<ClusterWork>,
             var carverProgress: Int = 0,
-            var featureProgress: Int = 0
+            var featureProgress: Int = 0,
+            var lightProgress: Int = 0
         )
 
         val dimWork = dimensions.map { (dimId, key) ->
@@ -271,13 +327,17 @@ object SteelExtractor : ModInitializer {
                 val featureQueue = ArrayDeque<ChunkPos>()
                 carverQueue.addAll(positions)
                 featureQueue.addAll(positions)
-                clusters.add(ClusterWork(positions, carverQueue, featureQueue))
+                val lightPositions = lightDependencyPositions(positions)
+                val lightQueue = ArrayDeque<ChunkPos>()
+                lightQueue.addAll(lightPositions)
+                clusters.add(ClusterWork(positions, lightPositions, carverQueue, featureQueue, lightQueue))
             }
             DimensionWork(key, dimId, clusters)
         }
         val chunksPerDim = sampledPositions.size
+        val lightChunksPerDim = generationClusters.sumOf { lightDependencyPositions(it).size }
         val totalChunks = chunksPerDim * dimWork.size
-        val totalChunkSteps = totalChunks * 2
+        val totalChunkSteps = (chunksPerDim * 2 + lightChunksPerDim) * dimWork.size
 
         var generationStarted = false
         var currentDimIdx = 0
@@ -291,7 +351,7 @@ object SteelExtractor : ModInitializer {
             // Start generation on first tick after server is ready
             if (!generationStarted) {
                 generationStarted = true
-                logger.info("Forcing deterministic generation of $totalChunks chunks across ${dimWork.size} dimensions (carvers $CARVER_CHUNKS_PER_TICK/tick, features $FEATURE_CHUNKS_PER_TICK/tick, order x/z ascending)...")
+                logger.info("Forcing deterministic generation of $totalChunks chunks across ${dimWork.size} dimensions (carvers $CARVER_CHUNKS_PER_TICK/tick, features $FEATURE_CHUNKS_PER_TICK/tick, light $LIGHT_CHUNKS_PER_TICK/tick, order x/z ascending)...")
             }
 
             // Generate a batch of chunks per tick, one dimension at a time
@@ -318,10 +378,16 @@ object SteelExtractor : ModInitializer {
                     return@register
                 }
 
-                val (queue, status, batchSize) = if (cluster.carverQueue.isNotEmpty()) {
-                    Triple(cluster.carverQueue, ChunkStatus.CARVERS, CARVER_CHUNKS_PER_TICK)
-                } else {
-                    Triple(cluster.featureQueue, ChunkStatus.FEATURES, FEATURE_CHUNKS_PER_TICK)
+                val (queue, status, batchSize) = when {
+                    cluster.carverQueue.isNotEmpty() -> {
+                        Triple(cluster.carverQueue, ChunkStatus.CARVERS, CARVER_CHUNKS_PER_TICK)
+                    }
+                    cluster.featureQueue.isNotEmpty() -> {
+                        Triple(cluster.featureQueue, ChunkStatus.FEATURES, FEATURE_CHUNKS_PER_TICK)
+                    }
+                    else -> {
+                        Triple(cluster.lightQueue, ChunkStatus.LIGHT, LIGHT_CHUNKS_PER_TICK)
+                    }
                 }
 
                 var generatedThisTick = 0
@@ -333,19 +399,19 @@ object SteelExtractor : ModInitializer {
                             cluster.featureChunks[pos] = chunk
                         }
                         dim.featureProgress++
+                    } else if (status == ChunkStatus.LIGHT) {
+                        if (chunk != null) {
+                            cluster.lightChunks[pos] = chunk
+                        }
+                        dim.lightProgress++
                     } else {
                         dim.carverProgress++
                     }
                     generatedThisTick++
                 }
 
-                val dimProgress = dim.carverProgress + dim.featureProgress
-                val overallProgress = currentDimIdx * chunksPerDim * 2 + dimProgress
-                val clusterNumber = clusterCount - dim.clusters.size + 1
-                logger.info("Chunk generation progress: $overallProgress/$totalChunkSteps (${dim.dimId}: cluster $clusterNumber/$clusterCount, carvers ${dim.carverProgress}/$chunksPerDim, features ${dim.featureProgress}/$chunksPerDim)")
-
-                if (cluster.carverQueue.isEmpty() && cluster.featureQueue.isEmpty()) {
-                    // Mark any chunks loaded from disk as ready.
+                if (cluster.carverQueue.isEmpty() && cluster.featureQueue.isEmpty() && !cluster.featureHashesCaptured) {
+                    // Mark any feature chunks loaded from disk as ready.
                     for (pos in cluster.positions) {
                         if (ChunkStageHashStorage.markReady(pos, dim.dimId)) {
                             manuallyMarked++
@@ -357,6 +423,82 @@ object SteelExtractor : ModInitializer {
                         cluster.positions,
                         cluster.featureChunks
                     )
+                    cluster.featureHashesCaptured = true
+                }
+
+                val dimProgress = dim.carverProgress + dim.featureProgress + dim.lightProgress
+                val overallProgress = currentDimIdx * (chunksPerDim * 2 + lightChunksPerDim) + dimProgress
+                val clusterNumber = clusterCount - dim.clusters.size + 1
+                logger.info("Chunk generation progress: $overallProgress/$totalChunkSteps (${dim.dimId}: cluster $clusterNumber/$clusterCount, carvers ${dim.carverProgress}/$chunksPerDim, features ${dim.featureProgress}/$chunksPerDim, light ${dim.lightProgress}/$lightChunksPerDim)")
+
+                if (
+                    cluster.carverQueue.isEmpty() &&
+                    cluster.featureQueue.isEmpty() &&
+                    cluster.lightQueue.isEmpty() &&
+                    !cluster.lightHashesCaptured
+                ) {
+                    val barrier = cluster.pendingLightCaptureBarrier
+                    if (barrier == null) {
+                        val lightEngine = level.chunkSource.lightEngine
+                        val pendingTasks = cluster.lightPositions
+                            .map { pos -> lightEngine.waitForPendingTasks(pos.x, pos.z) }
+                            .toTypedArray()
+                        cluster.pendingLightCaptureBarrier = CompletableFuture.allOf(*pendingTasks)
+                        logger.info("All tracked LIGHT chunks are ready for ${dim.dimId}; waiting for pending light tasks before capture")
+                        return@register
+                    }
+                    if (!barrier.isDone) {
+                        logger.info("Waiting for pending light tasks before light hash capture (${dim.dimId})")
+                        return@register
+                    }
+                    barrier.join()
+                    cluster.pendingLightCaptureBarrier = null
+                    if (level.chunkSource.lightEngine.hasLightWork()) {
+                        cluster.lightCaptureReadyPasses = 0
+                        logger.info("Waiting for light engine idle before light hash capture (${dim.dimId})")
+                        return@register
+                    }
+
+                    val probe = probeLightCaptureReadiness(level, cluster.lightPositions, cluster.lightChunks)
+                    if (!probe.isReady) {
+                        cluster.lightCaptureReadyPasses = 0
+                        cluster.lightCaptureWaitPasses++
+                        if (cluster.lightCaptureWaitPasses > MAX_LIGHT_CAPTURE_WAIT_PASSES) {
+                            error(
+                                "Light capture for ${dim.dimId} did not stabilize after $MAX_LIGHT_CAPTURE_WAIT_PASSES passes: " +
+                                    "missing_chunks=${probe.missingChunks}, samples=${probe.samples}"
+                            )
+                        }
+                        logger.info(
+                            "Waiting for light chunk availability before light hash capture (${dim.dimId}): " +
+                                "missing_chunks=${probe.missingChunks}, samples=${probe.samples}"
+                        )
+                        return@register
+                    }
+
+                    cluster.lightCaptureReadyPasses++
+                    if (cluster.lightCaptureReadyPasses < LIGHT_CAPTURE_READY_PASSES) {
+                        logger.info(
+                            "Light capture readiness pass ${cluster.lightCaptureReadyPasses}/$LIGHT_CAPTURE_READY_PASSES complete for ${dim.dimId}; waiting one more barrier"
+                        )
+                        return@register
+                    }
+                    cluster.lightCaptureWaitPasses = 0
+
+                    chunkStageExtractor.captureFinalLightHashes(
+                        server,
+                        dim.dimId,
+                        cluster.positions,
+                        cluster.lightChunks
+                    )
+                    cluster.lightHashesCaptured = true
+                }
+
+                if (
+                    cluster.carverQueue.isEmpty() &&
+                    cluster.featureQueue.isEmpty() &&
+                    cluster.lightQueue.isEmpty()
+                ) {
                     dim.clusters.removeFirst()
                 }
 
@@ -381,6 +523,11 @@ object SteelExtractor : ModInitializer {
                         chunkStageExtractor.writeBinaryBlockData(outputDirectory)
                     } catch (e: java.lang.Exception) {
                         logger.error("Binary block data extraction failed.", e)
+                    }
+                    try {
+                        chunkStageExtractor.writeBinaryLightData(outputDirectory)
+                    } catch (e: java.lang.Exception) {
+                        logger.error("Binary light data extraction failed.", e)
                     }
                 }
                 logger.info("All extractors complete!")

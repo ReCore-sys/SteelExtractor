@@ -4,6 +4,7 @@ import com.google.gson.JsonArray
 import com.google.gson.JsonElement
 import com.google.gson.JsonObject
 import com.steelextractor.ChunkStageHashStorage
+import com.steelextractor.LightSectionData
 import com.steelextractor.SteelExtractor
 import net.minecraft.server.MinecraftServer
 import net.minecraft.world.level.ChunkPos
@@ -34,6 +35,10 @@ class ChunkStageHashes : SteelExtractor.Extractor {
         json.addProperty("feature_hash_capture", "after_all_tracked_features_ready")
         json.addProperty("biome_tie_breaker", "vanilla_rtree_chunk_local_cache")
         json.addProperty("hashset_iteration_order", "insertion_order")
+        json.addProperty("light_hash_capture", "after_all_tracked_light_ready_pending_tasks_drained_and_light_engine_idle")
+        json.addProperty("light_dependency_radius", SteelExtractor.LIGHT_DEPENDENCY_RADIUS)
+        json.addProperty("light_hash_format", "packet_data_layers_v1")
+        json.addProperty("light_binary_format", "packet_data_layers_and_sky_sources_binary_v1")
 
         if (worldSeed != 13579L) {
             logger.warn("World seed is $worldSeed, not 13579! Set level-seed=13579 in server.properties and delete the world folder.")
@@ -124,6 +129,55 @@ class ChunkStageHashes : SteelExtractor.Extractor {
         logger.info("Captured final feature hashes for $captured/${trackedChunks.size} chunks in $dimension")
     }
 
+    fun captureFinalLightHashes(
+        server: MinecraftServer,
+        dimension: String,
+        positions: Collection<ChunkPos>,
+        lightChunks: Map<ChunkPos, ChunkAccess>
+    ) {
+        val positionSet = positions.toSet()
+        val trackedChunks = ChunkStageHashStorage.getTrackedChunks()
+            .filter { it.dimension == dimension && positionSet.contains(it.pos) }
+            .sortedWith(compareBy({ it.pos.x }, { it.pos.z }))
+        if (trackedChunks.isEmpty()) {
+            return
+        }
+
+        val levelKey = when (dimension) {
+            "minecraft:overworld" -> Level.OVERWORLD
+            "minecraft:the_nether" -> Level.NETHER
+            "minecraft:the_end" -> Level.END
+            else -> {
+                logger.warn("Cannot capture final light hashes for unknown dimension $dimension")
+                return
+            }
+        }
+        val level = server.getLevel(levelKey) ?: run {
+            logger.warn("Cannot capture final light hashes for missing level $dimension")
+            return
+        }
+
+        var captured = 0
+        for (tracked in trackedChunks) {
+            val chunk = lightChunks[tracked.pos] ?: level.getChunk(tracked.pos.x, tracked.pos.z, ChunkStatus.LIGHT, false)
+            if (chunk == null) {
+                logger.warn("Tracked chunk ${tracked.pos} in $dimension is not loaded at LIGHT; skipping final light hash")
+                continue
+            }
+
+            if (ChunkStageHashStorage.enableBinaryDump) {
+                val result = ChunkStageHashStorage.computeLightHashWithData(level.lightEngine, chunk)
+                ChunkStageHashStorage.storeHash(tracked.pos, dimension, ChunkStatus.LIGHT.toString(), result.hash)
+                ChunkStageHashStorage.storeLightData(tracked.pos, dimension, result.data)
+            } else {
+                val hash = ChunkStageHashStorage.computeLightHash(level.lightEngine, chunk)
+                ChunkStageHashStorage.storeHash(tracked.pos, dimension, ChunkStatus.LIGHT.toString(), hash)
+            }
+            captured++
+        }
+        logger.info("Captured final light hashes for $captured/${trackedChunks.size} chunks in $dimension")
+    }
+
     /**
      * Write per-dimension per-stage gzip-compressed binary files containing raw block state IDs.
      *
@@ -183,6 +237,76 @@ class ChunkStageHashes : SteelExtractor.Extractor {
                 }
 
                 logger.info("Wrote binary block data for $dimension stage '$stageName': ${chunksByPos.size} chunks -> $outputPath")
+            }
+        }
+    }
+
+    /**
+     * Write per-dimension gzip-compressed binary files containing raw light packet bytes.
+     *
+     * Format (all integers big-endian):
+     *   chunk_count: i32
+     *   For each chunk (sorted by x, z):
+     *     chunk_x: i32
+     *     chunk_z: i32
+     *     min_section_y: i32
+     *     section_count: i32
+     *     sky_source_count: i32
+     *     sky_sources: [i32; sky_source_count] in x + z * 16 order
+     *     For sky, then block:
+     *       For each light section:
+     *         state: u8 (0 = null, 1 = empty, 2 = data)
+     *         if state == 2:
+     *           bytes: [u8; 2048] in vanilla DataLayer order
+     */
+    fun writeBinaryLightData(outputDir: Path) {
+        val allData = ChunkStageHashStorage.getAllLightData()
+        if (allData.isEmpty()) {
+            logger.warn("No light data stored, skipping binary light output")
+            return
+        }
+
+        val dimGroups = allData.entries.groupBy { it.key.dimension }
+
+        for ((dimension, entries) in dimGroups) {
+            val dimShort = dimension.removePrefix("minecraft:")
+            val fileName = "chunk_stage_${dimShort}_light_layers.bin.gz"
+            val outputPath = outputDir.resolve("steel-core/test_assets/$fileName")
+            Files.createDirectories(outputPath.parent)
+
+            val chunksByPos = entries
+                .map { it.key.pos to it.value }
+                .sortedWith(compareBy({ it.first.x }, { it.first.z }))
+
+            GZIPOutputStream(Files.newOutputStream(outputPath)).use { gzip ->
+                DataOutputStream(gzip).use { dos ->
+                    dos.writeInt(chunksByPos.size)
+                    for ((pos, data) in chunksByPos) {
+                        dos.writeInt(pos.x)
+                        dos.writeInt(pos.z)
+                        dos.writeInt(data.minSection)
+                        dos.writeInt(data.sectionCount)
+                        dos.writeInt(data.skySources.size)
+                        for (sourceY in data.skySources) {
+                            dos.writeInt(sourceY)
+                        }
+                        writeLightLayer(dos, data.sky)
+                        writeLightLayer(dos, data.block)
+                    }
+                }
+            }
+
+            logger.info("Wrote binary light data for $dimension: ${chunksByPos.size} chunks -> $outputPath")
+        }
+    }
+
+    private fun writeLightLayer(dos: DataOutputStream, sections: List<LightSectionData>) {
+        for (section in sections) {
+            dos.writeByte(section.state)
+            if (section.state == 2) {
+                val bytes = section.bytes ?: error("light section marked data without bytes")
+                require(bytes.size == 2048) { "light section byte length was ${bytes.size}, expected 2048" }
+                dos.write(bytes)
             }
         }
     }
