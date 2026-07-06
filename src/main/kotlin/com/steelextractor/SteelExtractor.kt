@@ -59,10 +59,10 @@ object SteelExtractor : ModInitializer {
     private val logger = LoggerFactory.getLogger("steel-extractor")
 
     /** Set to false to skip chunk generation and chunk stage hash extraction. */
-    private val ENABLE_CHUNK_EXTRACTION = System.getenv("STEEL_EXTRACTOR_ENABLE_CHUNK_EXTRACTION")?.toBoolean() ?: true
+    private val ENABLE_CHUNK_EXTRACTION = envFlag("STEEL_EXTRACTOR_ENABLE_CHUNK_EXTRACTION")
 
     /** Set to false to skip storing per-chunk block data in memory and writing binary dump files. */
-    private const val ENABLE_BINARY_DUMP = true
+    private val ENABLE_BINARY_DUMP = envFlag("STEEL_EXTRACTOR_ENABLE_BINARY_DUMP")
 
     /** Sampling parameters: place random CLUSTER_SIZE x CLUSTER_SIZE clusters within a SAMPLE_HALF_RANGE*2 x SAMPLE_HALF_RANGE*2 area. */
     const val CHUNK_SAMPLE_SEED: Long = 123456
@@ -201,7 +201,7 @@ object SteelExtractor : ModInitializer {
         // Example: STEEL_EXTRACTOR_DISABLE_BLOCKS=1
         val immediateExtractors = mutableListOf<Extractor>()
         fun addUnlessDisabled(name: String, supplier: () -> Extractor) {
-            if (System.getenv("STEEL_EXTRACTOR_DISABLE_$name")?.toBoolean() == true) {
+            if (envFlag("STEEL_EXTRACTOR_DISABLE_$name")) {
                 logger.info("Extractor $name disabled via STEEL_EXTRACTOR_DISABLE_$name")
             } else {
                 immediateExtractors.add(supplier())
@@ -313,7 +313,7 @@ object SteelExtractor : ModInitializer {
 
             if (!ENABLE_CHUNK_EXTRACTION) {
                 logger.info("All extractors complete! (chunk extraction skipped)")
-                if (System.getenv("STEEL_EXTRACTOR_EXIT_ON_COMPLETE")?.toBoolean() == true) {
+                if (envFlag("STEEL_EXTRACTOR_EXIT_ON_COMPLETE")) {
                     logger.info("Exiting because STEEL_EXTRACTOR_EXIT_ON_COMPLETE is enabled")
                     ServerLifecycleEvents.SERVER_STOPPING.invoker().onServerStopping(server);
                     server.halt(false); // false means to do a graceful shutdown
@@ -584,7 +584,7 @@ object SteelExtractor : ModInitializer {
                     }
                 }
                 logger.info("All extractors complete!")
-                if (System.getenv("STEEL_EXTRACTOR_EXIT_ON_COMPLETE")?.toBoolean() == true) {
+                if (envFlag("STEEL_EXTRACTOR_EXIT_ON_COMPLETE")) {
                     logger.info("Exiting because STEEL_EXTRACTOR_EXIT_ON_COMPLETE is enabled")
                     exitProcess(0);
                 }
